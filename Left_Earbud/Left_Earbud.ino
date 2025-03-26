@@ -2,7 +2,6 @@
 #include <esp_now.h>
 #include <BluetoothSerial.h>
 #include <esp_wifi.h>
-#include <driver/i2s.h>
 
 BluetoothSerial BTSerial;
 bool isMaster = false;
@@ -11,141 +10,75 @@ uint8_t masterMAC[6] = {0};
 uint8_t slaveMAC[6] = {0};
 esp_now_peer_info_t peerInfo;
 
-// I2S Configuration
-#define I2S_MIC_SD 32
-#define I2S_MIC_WS 25
-#define I2S_MIC_SCK 26
-
-#define I2S_SPK_SD 27
-#define I2S_SPK_WS 14
-#define I2S_SPK_SCK 15
-
-#define SAMPLE_RATE 16000
-#define BUFFER_SIZE 512
-
-// Audio buffers
-int16_t micBuffer[BUFFER_SIZE];
-int16_t spkBuffer[BUFFER_SIZE];
-
-#define BUFFER_SIZE_32 32
-char btBuffer[BUFFER_SIZE_32];
+#define BUFFER_SIZE 32
+char btBuffer[BUFFER_SIZE];
 int btIndex = 0;
-char serialBuffer[BUFFER_SIZE_32];
+char serialBuffer[BUFFER_SIZE];
 int serialIndex = 0;
 
 typedef struct {
-    char type;  // 'M' for message, 'A' for audio
-    char data[31];
+    char message[32];
     unsigned long sendTime;
+    unsigned long syncTime;  // New: Synchronization timestamp
 } DataPacket;
 
 DataPacket dataPacket;
+unsigned long timeOffset = 0;  // Offset correction for accurate latency
 
-void setupI2S() {
-    // Configure I2S for microphone (input)
-    i2s_config_t mic_i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = 0,
-        .dma_buf_count = 4,
-        .dma_buf_len = 64,
-        .use_apll = false
-    };
-
-    i2s_pin_config_t mic_pin_config = {
-        .bck_io_num = I2S_MIC_SCK,
-        .ws_io_num = I2S_MIC_WS,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_MIC_SD
-    };
-
-    if (i2s_driver_install(I2S_NUM_0, &mic_i2s_config, 0, NULL) != ESP_OK) {
-        Serial.println("Failed to install I2S microphone driver");
-        return;
-    }
-    if (i2s_set_pin(I2S_NUM_0, &mic_pin_config) != ESP_OK) {
-        Serial.println("Failed to set I2S microphone pins");
-        return;
-    }
-
-    // Configure I2S for speaker (output)
-    i2s_config_t spk_i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = 0,
-        .dma_buf_count = 4,
-        .dma_buf_len = 64,
-        .use_apll = false
-    };
-
-    i2s_pin_config_t spk_pin_config = {
-        .bck_io_num = I2S_SPK_SCK,
-        .ws_io_num = I2S_SPK_WS,
-        .data_out_num = I2S_SPK_SD,
-        .data_in_num = I2S_PIN_NO_CHANGE
-    };
-
-    if (i2s_driver_install(I2S_NUM_1, &spk_i2s_config, 0, NULL) != ESP_OK) {
-        Serial.println("Failed to install I2S speaker driver");
-        return;
-    }
-    if (i2s_set_pin(I2S_NUM_1, &spk_pin_config) != ESP_OK) {
-        Serial.println("Failed to set I2S speaker pins");
-        return;
-    }
-
-    Serial.println("I2S initialized successfully");
-}
-
+// Callback for receiving ESP-NOW data
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     DataPacket* pkt = (DataPacket*)data;
     
-    if (pkt->type == 'A') {  // Audio data
-        // Play received audio on speaker
-        size_t bytes_written;
-        if (i2s_write(I2S_NUM_1, pkt->data, sizeof(pkt->data), &bytes_written, portMAX_DELAY) != ESP_OK) {
-            Serial.println("Failed to write audio to speaker");
-        }
-        
-        // Forward to Bluetooth if master
-        if (isMaster) {
-            BTSerial.write((uint8_t*)pkt, len);
-        }
-    } else {  // Regular message
-        Serial.print("Received: ");
-        Serial.println(pkt->data);
-        BTSerial.println(pkt->data);
+    // Synchronize timestamps during startup handshake
+    if (strcmp(pkt->message, "SYNC") == 0) {
+        timeOffset = micros() - pkt->syncTime;
+        Serial.println("Time synchronized!");
+        return;
+    }
 
-        if (isMaster) {
-            if (memcmp(slaveMAC, info->src_addr, 6) != 0) {
-                memcpy(slaveMAC, info->src_addr, 6);
-                if (!esp_now_is_peer_exist(slaveMAC)) {
-                    esp_now_peer_info_t peer;
-                    memset(&peer, 0, sizeof(peer));
-                    memcpy(peer.peer_addr, slaveMAC, 6);
-                    peer.channel = 1;
-                    peer.encrypt = false;
+    // Accurate latency calculation with synchronization offset
+    unsigned long receivedTime = micros();
+    unsigned long latency = (receivedTime - pkt->sendTime) - timeOffset;
+    float latency_ms = latency / 1000.0; // Convert to milliseconds
 
-                    if (esp_now_add_peer(&peer) == ESP_OK) {
-                        Serial.println("Slave peer added");
-                    }
+    Serial.print("Received: ");
+    Serial.print(pkt->message);
+    Serial.print(" | Latency: ");
+    Serial.print(latency_ms, 3); // Print with 3 decimal places
+    Serial.println(" ms");
+
+    BTSerial.println(pkt->message);  // Forward message to Bluetooth
+
+    if (isMaster) {
+        // Register slave MAC if received from a new device
+        if (memcmp(slaveMAC, info->src_addr, 6) != 0) {
+            memcpy(slaveMAC, info->src_addr, 6);
+
+            if (!esp_now_is_peer_exist(slaveMAC)) {
+                esp_now_peer_info_t peer;
+                memset(&peer, 0, sizeof(peer));
+                memcpy(peer.peer_addr, slaveMAC, 6);
+                peer.channel = 1;
+                peer.encrypt = false;
+
+                if (esp_now_add_peer(&peer) == ESP_OK) {
+                    Serial.println("Slave peer added successfully");
+                } else {
+                    Serial.println("Failed to add slave peer");
                 }
             }
         }
     }
 }
 
+// Callback for sending ESP-NOW data
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     Serial.printf("Data sent to: %02X:%02X:%02X:%02X:%02X:%02X, Status: %s\n",
                   mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
                   status == ESP_NOW_SEND_SUCCESS ? "Success" : "Failed");
 }
+
+// Scan for master ESP32
 void scanForMaster() {
     const int maxRetries = 3;
     const int scanChannel = 1;
@@ -171,6 +104,8 @@ void scanForMaster() {
         WiFi.scanDelete();
     }
 }
+
+// Register the master as a peer
 void registerMasterPeer() {
     if (!esp_now_is_peer_exist(masterMAC)) {
         memset(&peerInfo, 0, sizeof(peerInfo));
@@ -185,6 +120,8 @@ void registerMasterPeer() {
         }
     }
 }
+
+// Initialize ESP-NOW communication
 void initESPNow() {
     if (esp_now_init() != ESP_OK) {
         Serial.println("ESP-NOW init failed");
@@ -193,59 +130,35 @@ void initESPNow() {
     esp_now_register_recv_cb(OnDataRecv);
     esp_now_register_send_cb(OnDataSent);
 }
-void sendAudioPacket() {
-    static unsigned long lastMicRead = 0;
-    if (micros() - lastMicRead < 1000000 / (SAMPLE_RATE / (BUFFER_SIZE_32 / 2))) return;
 
-    size_t bytesRead = 0;
-    if (i2s_read(I2S_NUM_0, micBuffer, BUFFER_SIZE_32, &bytesRead, 0) != ESP_OK) {
-        Serial.println("Failed to read from microphone");
-        return;
+// Send data via ESP-NOW
+void sendData(const char* msg) {
+    strncpy(dataPacket.message, msg, sizeof(dataPacket.message) - 1);
+    dataPacket.message[sizeof(dataPacket.message) - 1] = '\0';
+    dataPacket.sendTime = micros() - timeOffset;
+
+    uint8_t* targetMAC = isMaster ? slaveMAC : masterMAC;
+
+    if (memcmp(targetMAC, "\0\0\0\0\0\0", 6) != 0) {
+        esp_err_t result = esp_now_send(targetMAC, (uint8_t*)&dataPacket, sizeof(dataPacket));
+        Serial.printf("Send %s\n", result == ESP_OK ? "OK" : "Fail");
+        delay(10);
+    } else {
+        Serial.println("No valid peer to send data");
     }
 
-    if (bytesRead > 0) {
-        DataPacket audioPacket;
-        audioPacket.type = 'A';
-        memcpy(audioPacket.data, micBuffer, bytesRead);
-        audioPacket.sendTime = micros();
-
-        uint8_t* targetMAC = isMaster ? slaveMAC : masterMAC;
-        if (memcmp(targetMAC, "\0\0\0\0\0\0", 6) != 0) {
-            esp_now_send(targetMAC, (uint8_t*)&audioPacket, sizeof(audioPacket));
-        }
-
-        // If slave, also send to master via ESP-NOW
-        if (!isMaster && masterFound) {
-            esp_now_send(masterMAC, (uint8_t*)&audioPacket, sizeof(audioPacket));
-        }
+    if (isMaster) {
+        BTSerial.println(dataPacket.message);
     }
-    lastMicRead = micros();
 }
 
-void processBluetoothAudio() {
-    static uint8_t btAudioBuffer[BUFFER_SIZE_32];
-    static int btAudioIndex = 0;
-    
-    while (BTSerial.available()) {
-        btAudioBuffer[btAudioIndex++] = BTSerial.read();
-        
-        if (btAudioIndex == sizeof(DataPacket)) {
-            DataPacket* pkt = (DataPacket*)btAudioBuffer;
-            if (pkt->type == 'A') {
-                // Play received audio
-                size_t bytes_written;
-                if (i2s_write(I2S_NUM_1, pkt->data, sizeof(pkt->data), &bytes_written, portMAX_DELAY) != ESP_OK) {
-                    Serial.println("Failed to write audio to speaker");
-                }
-                
-                // Forward to slave if master
-                if (isMaster) {
-                    esp_now_send(slaveMAC, (uint8_t*)pkt, sizeof(DataPacket));
-                }
-            }
-            btAudioIndex = 0;
-        }
-    }
+// Synchronization handshake
+void syncTime() {
+    strcpy(dataPacket.message, "SYNC");
+    dataPacket.syncTime = micros();
+
+    uint8_t* targetMAC = isMaster ? slaveMAC : masterMAC;
+    esp_now_send(targetMAC, (uint8_t*)&dataPacket, sizeof(dataPacket));
 }
 
 void setup() {
@@ -257,7 +170,6 @@ void setup() {
 
     scanForMaster();
     isMaster = !masterFound;
-    setupI2S(); // Initialize I2S after Bluetooth
 
     if (isMaster) {
         WiFi.softAP("ESP32_TWS_Master", nullptr, 1);
@@ -284,12 +196,35 @@ void setup() {
     if (!isMaster) {
         registerMasterPeer();
         delay(500);
+        syncTime();  // Synchronize time after connecting
     }
-
 }
 
 void loop() {
-    // Existing loop code
-    sendAudioPacket();
-    processBluetoothAudio();
+    while (BTSerial.available()) {
+        char c = BTSerial.read();
+        if (c == '\n' || btIndex >= BUFFER_SIZE - 1) {
+            btBuffer[btIndex] = '\0';
+            sendData(btBuffer);
+            btIndex = 0;
+        } else {
+            btBuffer[btIndex++] = c;
+        }
+    }
+
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || serialIndex >= BUFFER_SIZE - 1) {
+            serialBuffer[serialIndex] = '\0';
+            sendData(serialBuffer);
+            serialIndex = 0;
+        } else {
+            serialBuffer[serialIndex++] = c;
+        }
+    }
+
+    if (!isMaster && WiFi.status() != WL_CONNECTED) {
+        Serial.println("Lost connection, restarting...");
+        ESP.restart();
+    }
 }
