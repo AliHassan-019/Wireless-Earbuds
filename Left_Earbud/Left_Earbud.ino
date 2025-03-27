@@ -156,35 +156,30 @@ void setup() {
 
     // Configure I2S
     auto cfg = i2s.defaultConfig();
-    cfg.pin_bck = 27; // Adjust pins according to your setup
+    cfg.pin_bck = 27; 
     cfg.pin_ws = 26;
     cfg.pin_data = 25;
     i2s.begin(cfg);
-    Serial.println("I2S initialized");
+    Serial.println("I2S initialized.");
 
     // Initialize WiFi and ESP-NOW
     WiFi.mode(WIFI_AP_STA);
     esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
-    esp_wifi_config_espnow_rate(WIFI_IF_AP, WIFI_PHY_RATE_54M);
     
     scanForMaster();
     isMaster = !masterFound;
 
     if (isMaster) {
-        Serial.println("Running in MASTER mode");
+        Serial.println("Running in MASTER mode.");
         WiFi.softAP("ESP32_TWS_Master", nullptr, 1);
-        Serial.println("SoftAP started");
+        Serial.println("SoftAP started.");
         
         // Start Bluetooth A2DP sink
         a2dp_sink.set_stream_reader(read_data_stream, false);
         a2dp_sink.start("MySpeaker");
-        Serial.println("Bluetooth A2DP sink started");
-
-        // Initialize ESP-NOW after setting up AP
-        initESPNow();
+        Serial.println("Bluetooth A2DP sink started.");
     } else {
-        Serial.println("Running in SLAVE mode");
+        Serial.println("Running in SLAVE mode.");
         WiFi.begin("ESP32_TWS_Master", nullptr, 1);
         
         Serial.println("Connecting to master AP...");
@@ -192,26 +187,19 @@ void setup() {
             delay(250);
             Serial.print(".");
         }
-        Serial.println("\nConnected to master AP");
-        
-        // Initialize ESP-NOW before adding peers or sending data
-        initESPNow();
+        Serial.println("\nConnected to master AP.");
         
         registerMasterPeer();
         
         // Send "hello" to master
         DataPacket packet = {0};
         memcpy(packet.audio_data, "hello", 5);
-        esp_err_t result = esp_now_send(masterMAC, (uint8_t*)&packet, sizeof(packet));
-        if (result == ESP_OK) {
-            Serial.println("Sent hello packet to master");
-        } else {
-            Serial.print("Failed to send hello packet. Error: ");
-            Serial.println(result);
-        }
+        esp_now_send(masterMAC, (uint8_t*)&packet, sizeof(packet));
+        Serial.println("Sent hello packet to master.");
     }
 
-    Serial.println("Setup complete");
+    initESPNow();
+    Serial.println("Setup complete.");
 }
 
 void loop() {
